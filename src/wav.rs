@@ -60,12 +60,15 @@ impl WavFile {
 }
 
 pub fn delta_encode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8> {
+    if bits_per_sample == 0 || (bits_per_sample != 16 && bits_per_sample != 32) {
+        return pcm.to_vec();
+    }
+
     let bytes_per_sample = (bits_per_sample / 8) as usize;
     let sample_count = pcm.len() / bytes_per_sample;
 
     match bits_per_sample {
         16 => {
-            // 16bit: デルタ符号化 + バイトプレーン分離
             let mut deltas = vec![0i16; sample_count];
             let mut prev = 0i16;
             for i in 0..sample_count {
@@ -74,7 +77,6 @@ pub fn delta_encode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
                 deltas[i] = cur.wrapping_sub(prev);
                 prev = cur;
             }
-            // バイトプレーン分離: 下位バイト列 → 上位バイト列
             let mut out = Vec::with_capacity(pcm.len());
             for i in 0..sample_count {
                 out.push((deltas[i] & 0xFF) as u8);
@@ -85,8 +87,6 @@ pub fn delta_encode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
             out
         }
         32 => {
-            // 32bit float: バイトプレーン分離のみ
-            // 指数部・仮数部の上位ビットが集まって繰り返しが生まれる
             let mut planes = vec![Vec::with_capacity(sample_count); 4];
             for i in 0..sample_count {
                 let pos = i * 4;
@@ -95,7 +95,6 @@ pub fn delta_encode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
                 planes[2].push(pcm[pos+2]);
                 planes[3].push(pcm[pos+3]);
             }
-            // plane2・plane3 (指数部〜仮数部上位) にデルタをかける
             for p in 2..4 {
                 let mut prev = 0u8;
                 for v in planes[p].iter_mut() {
@@ -115,6 +114,10 @@ pub fn delta_encode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
 }
 
 pub fn delta_decode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8> {
+    if bits_per_sample == 0 || (bits_per_sample != 16 && bits_per_sample != 32) {
+        return pcm.to_vec();
+    }
+
     let bytes_per_sample = (bits_per_sample / 8) as usize;
     let sample_count = pcm.len() / bytes_per_sample;
 
@@ -123,7 +126,6 @@ pub fn delta_decode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
             let half = sample_count;
             let lo = &pcm[..half];
             let hi = &pcm[half..half*2];
-            // デルタ復号
             let mut out = Vec::with_capacity(pcm.len());
             let mut acc = 0i16;
             for i in 0..sample_count {
@@ -141,7 +143,6 @@ pub fn delta_decode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
                 pcm[n*2..n*3].to_vec(),
                 pcm[n*3..n*4].to_vec(),
             ];
-            // plane2・plane3 のデルタ復号
             for p in 2..4 {
                 let mut acc = 0u8;
                 for v in planes[p].iter_mut() {
@@ -149,7 +150,6 @@ pub fn delta_decode(pcm: &[u8], _channels: u16, bits_per_sample: u16) -> Vec<u8>
                     *v = acc;
                 }
             }
-            // インターリーブに戻す
             let mut out = Vec::with_capacity(pcm.len());
             for i in 0..n {
                 out.push(planes[0][i]);

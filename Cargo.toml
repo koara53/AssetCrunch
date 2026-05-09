@@ -1,0 +1,16 @@
+[package]
+name = "assetcrunch"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated game asset compressor for indie developers"
+license = "MIT"
+repository = "https://github.com/YOUR_USERNAME/AssetCrunch"
+keywords = ["gamedev", "compression", "gpu", "indie", "lz4"]
+categories = ["compression", "game-development"]
+
+[dependencies]
+wgpu = "22"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+lz4_flex = "0.11"

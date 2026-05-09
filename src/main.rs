@@ -8,7 +8,7 @@ use std::time::Instant;
 fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
-match args.get(1).map(|s| s.as_str()) {
+    match args.get(1).map(|s| s.as_str()) {
         Some("compress") => {
             let input  = args.get(2).expect("使い方: compress <input.wav> <output.gcwav>");
             let output = args.get(3).expect("使い方: compress <input.wav> <output.gcwav>");
@@ -47,7 +47,7 @@ match args.get(1).map(|s| s.as_str()) {
         Some("--bench") => {
             pollster::block_on(run());
         }
-_ => {
+        _ => {
             println!("AssetCrunch — GPU-accelerated game asset compressor");
             println!();
             println!("使い方:");
@@ -68,6 +68,7 @@ _ => {
         }
     }
 }
+
 #[repr(C)]
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 struct Params {
@@ -75,8 +76,11 @@ struct Params {
     chunk_count: u32,
 }
 
-const CHUNK_SIZE: u32 = 65536;
-const OUT_STRIDE: u32 = CHUNK_SIZE + 1024;
+const CHUNK_SIZE:  u32 = 65536;
+const OUT_STRIDE:  u32 = CHUNK_SIZE + 1024;
+const SUB_COUNT:   u32 = 4;
+const SUB_SIZE:    u32 = 16384;
+const SUB_STRIDE:  u32 = SUB_SIZE + 256;
 const BENCH_RUNS: usize = 5;
 
 async fn setup_gpu() -> (Device, Queue, ComputePipeline, BindGroupLayout) {
@@ -128,6 +132,8 @@ async fn setup_gpu() -> (Device, Queue, ComputePipeline, BindGroupLayout) {
     (device, queue, pipeline, bgl)
 }
 
+// 戻り値: (sub_sizes, packed)
+// sub_sizes: chunk_count × SUB_COUNT 個のサイズ
 async fn gpu_compress_data(
     device: &Device,
     queue: &Queue,
@@ -137,6 +143,7 @@ async fn gpu_compress_data(
 ) -> (Vec<u32>, Vec<u8>) {
     let total_bytes = data.len() as u32;
     let chunk_count = total_bytes.div_ceil(CHUNK_SIZE);
+    let sizes_count = chunk_count * SUB_COUNT;
 
     let src_buf = device.create_buffer_init(&util::BufferInitDescriptor {
         label: None, contents: data, usage: BufferUsages::STORAGE,
@@ -147,7 +154,7 @@ async fn gpu_compress_data(
         mapped_at_creation: false,
     });
     let sizes_buf = device.create_buffer(&BufferDescriptor {
-        label: None, size: (chunk_count * 4) as u64,
+        label: None, size: (sizes_count * 4) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -157,7 +164,7 @@ async fn gpu_compress_data(
         usage: BufferUsages::UNIFORM,
     });
     let staging_sizes = device.create_buffer(&BufferDescriptor {
-        label: None, size: (chunk_count * 4) as u64,
+        label: None, size: (sizes_count * 4) as u64,
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -166,6 +173,7 @@ async fn gpu_compress_data(
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+
     let bg = device.create_bind_group(&BindGroupDescriptor {
         label: None, layout: bgl,
         entries: &[
@@ -185,15 +193,15 @@ async fn gpu_compress_data(
         p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(chunk_count, 1, 1);
     }
-    enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (chunk_count * 4) as u64);
-    enc.copy_buffer_to_buffer(&dst_buf, 0, &staging_dst, 0, (chunk_count * OUT_STRIDE) as u64);
+    enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (sizes_count * 4) as u64);
+    enc.copy_buffer_to_buffer(&dst_buf,   0, &staging_dst,   0, (chunk_count * OUT_STRIDE) as u64);
     queue.submit(Some(enc.finish()));
 
     let (tx, rx) = std::sync::mpsc::channel();
     staging_sizes.slice(..).map_async(MapMode::Read, move |r| tx.send(r).unwrap());
     device.poll(Maintain::Wait);
     rx.recv().unwrap().unwrap();
-    let sizes: Vec<u32> = bytemuck::cast_slice(
+    let sub_sizes: Vec<u32> = bytemuck::cast_slice(
         &staging_sizes.slice(..).get_mapped_range()
     ).to_vec();
     staging_sizes.unmap();
@@ -207,14 +215,124 @@ async fn gpu_compress_data(
     ).to_vec();
     staging_dst.unmap();
 
+    // サブチャンクを順番に詰める
     let mut packed = Vec::new();
-    for (i, &sz) in sizes.iter().enumerate() {
-        let start = i * OUT_STRIDE as usize;
-        packed.extend_from_slice(&dst_raw[start..start + sz as usize]);
+    for ci in 0..chunk_count as usize {
+        for si in 0..SUB_COUNT as usize {
+            let sz    = sub_sizes[ci * SUB_COUNT as usize + si] as usize;
+            let start = ci * OUT_STRIDE as usize + si * SUB_STRIDE as usize;
+            packed.extend_from_slice(&dst_raw[start..start + sz]);
+        }
     }
 
-    (sizes, packed)
+    (sub_sizes, packed)
 }
+
+async fn compress_wav(input: &str, output: &str) {
+    let wav = match wav::WavFile::load(input) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("エラー: {}", e); return; }
+    };
+
+    println!("\n入力: {}", input);
+    println!("  {}ch  {}Hz  {}bit",
+        wav.channels, wav.sample_rate, wav.bits_per_sample);
+    println!("  PCMサイズ: {} bytes ({:.2} MB)",
+        wav.pcm_data.len(), wav.pcm_data.len() as f64 / 1024.0 / 1024.0);
+
+    let (device, queue, pipeline, bgl) = setup_gpu().await;
+
+    println!("\nデルタ符号化中...");
+    let pcm_to_compress = wav::delta_encode(
+        &wav.pcm_data, wav.channels, wav.bits_per_sample
+    );
+
+    println!("GPU圧縮中...");
+    let t = Instant::now();
+    let (sub_sizes, packed) = gpu_compress_data(
+        &device, &queue, &pipeline, &bgl, &pcm_to_compress
+    ).await;
+    let elapsed = t.elapsed();
+
+    let chunk_count = (pcm_to_compress.len() as u32).div_ceil(CHUNK_SIZE) as usize;
+    let total_compressed: u32 = sub_sizes.iter().sum();
+    let original_size   = wav.header.len() + wav.pcm_data.len();
+    let compressed_size = 8 + 4 + wav.header.len() + 4
+        + sub_sizes.len() * 4 + packed.len();
+
+    println!("完了: {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+    println!("  PCM圧縮率: {:.2}%  ({} → {} bytes)",
+        total_compressed as f64 / wav.pcm_data.len() as f64 * 100.0,
+        wav.pcm_data.len(), total_compressed);
+    println!("  ファイル削減: {:.2} MB → {:.2} MB  ({:.1}% 削減)",
+        original_size as f64 / 1024.0 / 1024.0,
+        compressed_size as f64 / 1024.0 / 1024.0,
+        (1.0 - compressed_size as f64 / original_size as f64) * 100.0);
+
+    let mut out_data = Vec::new();
+    out_data.extend_from_slice(b"GCWAV001");
+    out_data.extend_from_slice(&(wav.header.len() as u32).to_le_bytes());
+    out_data.extend_from_slice(&wav.header);
+    out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+    for &sz in &sub_sizes {
+        out_data.extend_from_slice(&sz.to_le_bytes());
+    }
+    out_data.extend_from_slice(&packed);
+
+    std::fs::write(output, &out_data).expect("書き込み失敗");
+    println!("出力: {}", output);
+}
+
+fn decompress_wav(input: &str, output: &str) {
+    let data = std::fs::read(input).expect("読み込み失敗");
+    if &data[0..8] != b"GCWAV001" {
+        eprintln!("GCWAVファイルではありません");
+        return;
+    }
+
+    let mut pos = 8usize;
+    let header_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+    let header = data[pos..pos+header_len].to_vec();
+    pos += header_len;
+
+    let chunk_count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let total_subs = chunk_count * SUB_COUNT as usize;
+    let mut sub_sizes = Vec::with_capacity(total_subs);
+    for _ in 0..total_subs {
+        sub_sizes.push(u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize);
+        pos += 4;
+    }
+
+    println!("解凍中... ({} チャンク × {} サブ)", chunk_count, SUB_COUNT);
+    let t = Instant::now();
+
+    let mut pcm_delta = Vec::new();
+    for ci in 0..chunk_count {
+        for si in 0..SUB_COUNT as usize {
+            let sz = sub_sizes[ci * SUB_COUNT as usize + si];
+            if sz == 0 { continue; }
+            let chunk = &data[pos..pos + sz];
+            let dec = lz4_flex::block::decompress(chunk, SUB_SIZE as usize)
+                .expect("解凍失敗");
+            pcm_delta.extend_from_slice(&dec);
+            pos += sz;
+        }
+    }
+
+    let channels        = u16::from_le_bytes(header[22..24].try_into().unwrap());
+    let bits_per_sample = u16::from_le_bytes(header[34..36].try_into().unwrap());
+    let pcm_data = wav::delta_decode(&pcm_delta, channels, bits_per_sample);
+
+    println!("完了: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    let wav_bytes = wav::WavFile::rebuild(&header, &pcm_data);
+    std::fs::write(output, &wav_bytes).expect("書き込み失敗");
+    println!("出力: {}  ({:.2} MB)",
+        output, wav_bytes.len() as f64 / 1024.0 / 1024.0);
+}
+
 async fn compress_mesh(input: &str, output: &str) {
     let mf = match mesh::MeshFile::load(input) {
         Ok(m) => m,
@@ -236,25 +354,37 @@ async fn compress_mesh(input: &str, output: &str) {
     let (device, queue, pipeline, bgl) = setup_gpu().await;
 
     println!("GPU圧縮中...");
-    let t = std::time::Instant::now();
-    let (chunk_sizes, packed) = gpu_compress_data(
+    let t = Instant::now();
+    let (sub_sizes, packed) = gpu_compress_data(
         &device, &queue, &pipeline, &bgl, &mf.data
     ).await;
     let elapsed = t.elapsed();
 
+    let chunk_count = (mf.data.len() as u32).div_ceil(CHUNK_SIZE) as usize;
+    let total_compressed: u32 = sub_sizes.iter().sum();
     let original_size   = mf.data.len();
-    let compressed_size = 8 + 1 + mf.ext.len() + 4 + chunk_sizes.len() * 4 + packed.len();
+    let compressed_size = 8 + 1 + mf.ext.len() + 4 + sub_sizes.len() * 4 + packed.len();
 
     println!("完了: {:.1}ms", elapsed.as_secs_f64() * 1000.0);
     println!("  圧縮率: {:.2}%  ({} → {} bytes)",
-        compressed_size as f64 / original_size as f64 * 100.0,
-        original_size, compressed_size);
+        total_compressed as f64 / original_size as f64 * 100.0,
+        original_size, total_compressed);
     println!("  削減: {:.2} MB → {:.2} MB  ({:.1}% 削減)",
         original_size as f64 / 1024.0 / 1024.0,
         compressed_size as f64 / 1024.0 / 1024.0,
         (1.0 - compressed_size as f64 / original_size as f64) * 100.0);
 
-    mesh::MeshFile::write_gcmesh(output, &mf.ext, &chunk_sizes, &packed);
+    // .gcmesh フォーマット出力
+    let mut out_data = Vec::new();
+    out_data.extend_from_slice(b"GCMESH01");
+    out_data.push(mf.ext.len() as u8);
+    out_data.extend_from_slice(mf.ext.as_bytes());
+    out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+    for &sz in &sub_sizes {
+        out_data.extend_from_slice(&sz.to_le_bytes());
+    }
+    out_data.extend_from_slice(&packed);
+    std::fs::write(output, &out_data).expect("書き込み失敗");
     println!("出力: {}", output);
 }
 
@@ -274,20 +404,25 @@ fn decompress_mesh(input: &str, output_dir: &str) {
     let chunk_count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
     pos += 4;
 
-    let mut chunk_sizes = Vec::with_capacity(chunk_count);
-    for _ in 0..chunk_count {
-        chunk_sizes.push(u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize);
+    let total_subs = chunk_count * SUB_COUNT as usize;
+    let mut sub_sizes = Vec::with_capacity(total_subs);
+    for _ in 0..total_subs {
+        sub_sizes.push(u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize);
         pos += 4;
     }
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
     let mut decompressed = Vec::new();
-    for &sz in &chunk_sizes {
-        let chunk = &data[pos..pos + sz];
-        let dec = lz4_flex::block::decompress(chunk, CHUNK_SIZE as usize)
-            .expect("解凍失敗");
-        decompressed.extend_from_slice(&dec);
-        pos += sz;
+    for ci in 0..chunk_count {
+        for si in 0..SUB_COUNT as usize {
+            let sz = sub_sizes[ci * SUB_COUNT as usize + si];
+            if sz == 0 { continue; }
+            let chunk = &data[pos..pos + sz];
+            let dec = lz4_flex::block::decompress(chunk, SUB_SIZE as usize)
+                .expect("解凍失敗");
+            decompressed.extend_from_slice(&dec);
+            pos += sz;
+        }
     }
     println!("完了: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
 
@@ -351,11 +486,12 @@ async fn compress_folder(input_dir: &str, output_dir: &str) {
                 let pcm_enc = wav::delta_encode(
                     &wav.pcm_data, wav.channels, wav.bits_per_sample
                 );
-                let (chunk_sizes, packed) = gpu_compress_data(
+                let (sub_sizes, packed) = gpu_compress_data(
                     &device, &queue, &pipeline, &bgl, &pcm_enc
                 ).await;
+                let chunk_count = (pcm_enc.len() as u32).div_ceil(CHUNK_SIZE) as usize;
                 let compressed_size = 8 + 4 + wav.header.len() + 4
-                    + chunk_sizes.len() * 4 + packed.len();
+                    + sub_sizes.len() * 4 + packed.len();
 
                 let out_file = out_path.join(
                     format!("{}.gcwav",
@@ -365,8 +501,8 @@ async fn compress_folder(input_dir: &str, output_dir: &str) {
                 out_data.extend_from_slice(b"GCWAV001");
                 out_data.extend_from_slice(&(wav.header.len() as u32).to_le_bytes());
                 out_data.extend_from_slice(&wav.header);
-                out_data.extend_from_slice(&(chunk_sizes.len() as u32).to_le_bytes());
-                for &sz in &chunk_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
+                out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+                for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
                 out_data.extend_from_slice(&packed);
                 std::fs::write(&out_file, &out_data).expect("書き込み失敗");
 
@@ -387,19 +523,25 @@ async fn compress_folder(input_dir: &str, output_dir: &str) {
                     Err(e) => { println!("  スキップ: {} — {}", filename, e); continue; }
                 };
                 let original_size = mf.data.len();
-                let (chunk_sizes, packed) = gpu_compress_data(
+                let (sub_sizes, packed) = gpu_compress_data(
                     &device, &queue, &pipeline, &bgl, &mf.data
                 ).await;
+                let chunk_count = (mf.data.len() as u32).div_ceil(CHUNK_SIZE) as usize;
                 let compressed_size = 8 + 1 + mf.ext.len() + 4
-                    + chunk_sizes.len() * 4 + packed.len();
+                    + sub_sizes.len() * 4 + packed.len();
 
                 let out_file = out_path.join(
                     format!("{}.gcmesh",
                         in_path.file_stem().unwrap().to_string_lossy())
                 );
-                mesh::MeshFile::write_gcmesh(
-                    out_file.to_str().unwrap(), &mf.ext, &chunk_sizes, &packed
-                );
+                let mut out_data = Vec::new();
+                out_data.extend_from_slice(b"GCMESH01");
+                out_data.push(mf.ext.len() as u8);
+                out_data.extend_from_slice(mf.ext.as_bytes());
+                out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+                for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
+                out_data.extend_from_slice(&packed);
+                std::fs::write(&out_file, &out_data).expect("書き込み失敗");
 
                 let kind = match ext.as_str() {
                     "obj"  => "OBJ  ",
@@ -436,107 +578,6 @@ async fn compress_folder(input_dir: &str, output_dir: &str) {
     for (name, _, _, ratio) in &sorted {
         println!("  {:.1}%  {}", ratio, name);
     }
-}
-async fn compress_wav(input: &str, output: &str) {
-    let wav = match wav::WavFile::load(input) {
-        Ok(w) => w,
-        Err(e) => { eprintln!("エラー: {}", e); return; }
-    };
-
-    println!("\n入力: {}", input);
-    println!("  {}ch  {}Hz  {}bit",
-        wav.channels, wav.sample_rate, wav.bits_per_sample);
-    println!("  PCMサイズ: {} bytes ({:.2} MB)",
-        wav.pcm_data.len(),
-        wav.pcm_data.len() as f64 / 1024.0 / 1024.0);
-
-    let (device, queue, pipeline, bgl) = setup_gpu().await;
-
-    println!("\nデルタ符号化中...");
-    let pcm_to_compress = wav::delta_encode(
-        &wav.pcm_data, wav.channels, wav.bits_per_sample
-    );
-
-    println!("GPU圧縮中...");
-    let t = Instant::now();
-    let (chunk_sizes, packed) = gpu_compress_data(
-        &device, &queue, &pipeline, &bgl, &pcm_to_compress
-    ).await;
-    let elapsed = t.elapsed();
-
-    let original_size   = wav.header.len() + wav.pcm_data.len();
-    let compressed_size = 8 + 4 + wav.header.len() + 4
-        + chunk_sizes.len() * 4 + packed.len();
-
-    println!("完了: {:.1}ms", elapsed.as_secs_f64() * 1000.0);
-    println!("  PCM圧縮率: {:.2}%  ({} → {} bytes)",
-        packed.len() as f64 / wav.pcm_data.len() as f64 * 100.0,
-        wav.pcm_data.len(), packed.len());
-    println!("  ファイル削減: {:.2} MB → {:.2} MB  ({:.1}% 削減)",
-        original_size as f64 / 1024.0 / 1024.0,
-        compressed_size as f64 / 1024.0 / 1024.0,
-        (1.0 - compressed_size as f64 / original_size as f64) * 100.0);
-
-    // .gcwav フォーマット出力
-    let mut out_data = Vec::new();
-    out_data.extend_from_slice(b"GCWAV001");
-    out_data.extend_from_slice(&(wav.header.len() as u32).to_le_bytes());
-    out_data.extend_from_slice(&wav.header);
-    out_data.extend_from_slice(&(chunk_sizes.len() as u32).to_le_bytes());
-    for &sz in &chunk_sizes {
-        out_data.extend_from_slice(&sz.to_le_bytes());
-    }
-    out_data.extend_from_slice(&packed);
-
-    std::fs::write(output, &out_data).expect("書き込み失敗");
-    println!("出力: {}", output);
-}
-
-fn decompress_wav(input: &str, output: &str) {
-    let data = std::fs::read(input).expect("読み込み失敗");
-
-    if &data[0..8] != b"GCWAV001" {
-        eprintln!("GCWAVファイルではありません");
-        return;
-    }
-
-    let mut pos = 8usize;
-    let header_len  = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-    pos += 4;
-    let header      = data[pos..pos+header_len].to_vec();
-    pos += header_len;
-    let chunk_count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-    pos += 4;
-
-    let mut chunk_sizes = Vec::with_capacity(chunk_count);
-    for _ in 0..chunk_count {
-        chunk_sizes.push(u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize);
-        pos += 4;
-    }
-
-    println!("解凍中... ({} チャンク)", chunk_count);
-    let t = Instant::now();
-
-    let mut pcm_delta = Vec::new();
-    for &sz in &chunk_sizes {
-        let chunk = &data[pos..pos + sz];
-        let dec = lz4_flex::block::decompress(chunk, CHUNK_SIZE as usize)
-            .expect("解凍失敗");
-        pcm_delta.extend_from_slice(&dec);
-        pos += sz;
-    }
-
-    // ヘッダからチャンネル数とビット深度を読んでデルタ復号化
-    let channels        = u16::from_le_bytes(header[22..24].try_into().unwrap());
-    let bits_per_sample = u16::from_le_bytes(header[34..36].try_into().unwrap());
-    let pcm_data = wav::delta_decode(&pcm_delta, channels, bits_per_sample);
-
-    println!("完了: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-
-    let wav_bytes = wav::WavFile::rebuild(&header, &pcm_data);
-    std::fs::write(output, &wav_bytes).expect("書き込み失敗");
-    println!("出力: {}  ({:.2} MB)",
-        output, wav_bytes.len() as f64 / 1024.0 / 1024.0);
 }
 
 fn gen_random(size: usize) -> Vec<u8> {
@@ -606,8 +647,9 @@ async fn run() {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let sizes_count = chunk_count * SUB_COUNT;
         let sizes_buf = device.create_buffer(&BufferDescriptor {
-            label: None, size: (chunk_count * 4) as u64,
+            label: None, size: (sizes_count * 4) as u64,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -617,7 +659,7 @@ async fn run() {
             usage: BufferUsages::UNIFORM,
         });
         let staging_sizes = device.create_buffer(&BufferDescriptor {
-            label: None, size: (chunk_count * 4) as u64,
+            label: None, size: (sizes_count * 4) as u64,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -645,7 +687,7 @@ async fn run() {
             let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
             { let mut p = enc.begin_compute_pass(&ComputePassDescriptor { label: None, timestamp_writes: None });
               p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(chunk_count, 1, 1); }
-            enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (chunk_count * 4) as u64);
+            enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (sizes_count * 4) as u64);
             let t = Instant::now();
             queue.submit(Some(enc.finish()));
             let (tx, rx) = std::sync::mpsc::channel();
@@ -661,7 +703,7 @@ async fn run() {
             let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
             { let mut p = enc.begin_compute_pass(&ComputePassDescriptor { label: None, timestamp_writes: None });
               p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(chunk_count, 1, 1); }
-            enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (chunk_count * 4) as u64);
+            enc.copy_buffer_to_buffer(&sizes_buf, 0, &staging_sizes, 0, (sizes_count * 4) as u64);
             queue.submit(Some(enc.finish()));
             device.poll(Maintain::Wait);
         }
@@ -669,11 +711,11 @@ async fn run() {
         staging_sizes.slice(..).map_async(MapMode::Read, move |r| tx.send(r).unwrap());
         device.poll(Maintain::Wait);
         rx.recv().unwrap().unwrap();
-        let gpu_sizes: Vec<u32> = bytemuck::cast_slice(
+        let sub_sizes: Vec<u32> = bytemuck::cast_slice(
             &staging_sizes.slice(..).get_mapped_range()
         ).to_vec();
         staging_sizes.unmap();
-        let gpu_bytes: u32 = gpu_sizes.iter().sum();
+        let gpu_bytes: u32 = sub_sizes.iter().sum();
 
         let gpu_avg = gpu_times.iter().sum::<f64>() / BENCH_RUNS as f64;
         let gpu_tp  = test_mb as f64 / gpu_avg;

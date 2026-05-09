@@ -1,198 +1,70 @@
-\#アセットクランチ
+# AssetCrunch
 
+GPU-accelerated game asset compressor for indie developers.
 
+ふりーむ・itch.io向けのゲームアセットをGPU並列LZ4で高速圧縮するCLIツールです。
 
-インディー開発者向け、GPUアクセラレーション対応ゲームアセット圧縮ツール。
+## 実測圧縮率
 
-
-
-ふりーむ・itch.io向けのゲームアセットをGPUボーダーLZ4で高速圧縮するCLIツールです。
-
-
-
-\## 実測圧縮率
-
-
-
-| フォーマット | 削減率 | メモ |
-
-
-
+| フォーマット | 削減率 | 備考 |
 |---|---|---|
-
-
-
-| JSON / TXT | \*\*75.6%\*\* | シーンデータ・設定ファイル |
-
-
-
-| OBJ/FBX | \*\*40.6%\*\* | 3Dメッシュ |
-
-
-
-| WAV | \*\*17.9%\*\* | ボイス・SE・BGM |
-
-
-
+| JSON / TXT | **75.6%** | シーンデータ・設定ファイル |
+| OBJ / FBX | **40.6%** | 3Dメッシュ |
+| WAV | **17.9%** | ボイス・SE・BGM |
 | PNG / MP3 / OGG | スキップ | 圧縮済みフォーマット |
 
+## 動作環境
 
+- Windows / Linux / macOS
+- Vulkan / DX12 / Metal 対応GPU
+- Rust 1.75以上
 
-\##動作環境
-
-
-
-\- Windows / Linux / macOS
-
-
-
-\- Vulkan / DX12 / Metal対応GPU
-
-
-
-\- 錆び1.75以上
-
-
-
-\## インストール
-
-
+## インストール
 
 ```bash
-
-
-
-git clone https://github.com/YOUR\\\_USERNAME/AssetCrunch
-
-
-
+git clone https://github.com/koara53/AssetCrunch
 cd AssetCrunch
-
-
-
 cargo build --release
+```
 
-
-
-\\```
-
-
-
-\##使い方
-
-
+## 使い方
 
 ```bash
+# WAV圧縮・解凍
+assetcrunch compress        <input.wav>      <output.gcwav>
+assetcrunch decompress      <input.gcwav>    <output.wav>
 
+# 3Dメッシュ圧縮・解凍 (OBJ / FBX)
+assetcrunch compress-mesh   <input.obj/fbx>  <output.gcmesh>
+assetcrunch decompress-mesh <input.gcmesh>   <output_dir>
 
+# テキスト系圧縮・解凍 (JSON / TXT)
+assetcrunch compress-text   <input.json/txt> <output.gcmesh>
+assetcrunch decompress-text <input.gcmesh>   <output_dir>
 
-\# WAV圧縮・解凍
+# フォルダ一括処理
+assetcrunch compress-folder <input_dir>      <output_dir>
 
-
-
-assetcrunch compress <input.wav> <output.gcwav>
-
-
-
-assetcrunch decompress <input.gcwav> <output.wav>
-
-
-
-\# 3Dメッシュ圧縮・解凍(OBJ / FBX)
-
-
-
-assetcrunch compress-mesh <input.obj/fbx> <output.gcmesh>
-
-
-
-assetcrunch decompress-mesh <input.gcmesh> <output\_dir>
-
-
-
-\#テキスト系圧縮・解凍(JSON / TXT)
-
-
-
-assetcrunch compress-text <input.json/txt> <output.gcmesh>
-
-
-
-assetcrunch decompress-text <input.gcmesh> <output\_dir>
-
-
-
-\#フォルダ一括処理
-
-
-
-assetcrunch compress-folder <input\_dir> <output\_dir>
-
-
-
-\#ベンチマーク
-
-
-
+# ベンチマーク
 assetcrunch --bench
+```
 
+## 対応フォーマット
 
-
-\\```
-
-
-
-\## 対応フォーマット
-
-
-
-| 種類 | 拡張子 | 処理 |
-
-
-
+| 種別 | 拡張子 | 処理 |
 |---|---|---|
+| 音声 | wav | デルタ符号化 + バイトプレーン分離 + GPU LZ4 |
+| 3Dメッシュ | obj, fbx | GPU LZ4 |
+| テキスト系 | json, txt | GPU LZ4 |
+| 圧縮済み | png, jpg, mp3, ogg | スキップ（膨張防止） |
 
+## 技術仕様
 
+- GPU: WGSLコンピュートシェーダー（wgpu経由でVulkan/DX12/Metal対応）
+- 圧縮: LZ4 block format（GPU並列実装）
+- WAV前処理: バイトプレーン分離 + デルタ符号化で圧縮率を改善
+- チャンクサイズ: 64KB（LZ4最大ウィンドウサイズ）
 
-| 音声 |ウェーブ | デルタ記号化 + バイトプレーン分離 + GPU LZ4 |
-
-
-
-| 3Dメッシュ |オブジェクト、FBX | GPU LZ4 |
-
-
-
-| テキスト系 | json、txt | GPU LZ4 |
-
-
-
-| 圧縮済み | png、jpg、mp3、ogg | スキップ（膨張防止） |
-
-
-
-\## 技術仕様
-
-
-
-\- GPU：WGSLコンピュートシェーダー（wgpu経由でVulkan/DX12/Metal対応）
-
-
-
-\- 圧縮：LZ4ブロック形式（GPU実装）
-
-
-
-\- WAV前処理:バイトプレーン分離+デルタ記号化で圧縮率を改善
-
-
-
-\- チャンクサイズ：64KB（LZ4最大ウィンドウサイズ）
-
-
-
-\## ライセンス
-
-
+## ライセンス
 
 MIT
-

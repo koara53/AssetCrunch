@@ -49,6 +49,23 @@ assetcrunch compress-folder <input_dir>      <output_dir>
 assetcrunch --bench
 ```
 
+## Windowsの右クリックメニューに登録
+
+管理者権限のPowerShellで実行：
+
+```powershell
+.\install.ps1
+```
+
+フォルダを右クリック → AssetCrunch → 圧縮 / 解凍 で使えます。
+
+削除する場合：
+
+```powershell
+.\uninstall.ps1
+```
+
+
 ## 対応フォーマット
 
 | 種別 | 拡張子 | 処理 |

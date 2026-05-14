@@ -25,6 +25,15 @@ GPU-accelerated game asset pack optimizer for indie developers.
 
 ## インストール
 
+## Download
+
+Windows users can download the latest `.zip` from the Releases page.
+
+1. Download `AssetCrunch-windows-x64.zip`
+2. Extract it
+3. Run `assetcrunch.exe`
+4. Optional: run `install.ps1` as Administrator to add the right-click menu
+
 ```bash
 git clone https://github.com/koara53/AssetCrunch
 cd AssetCrunch

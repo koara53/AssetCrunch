@@ -1,5 +1,11 @@
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
+#[cfg(windows)]
+use windows::core::PCWSTR;
+
 mod wav;
 mod mesh;
+mod manifest;
 
 use wgpu::*;
 use wgpu::util::DeviceExt;
@@ -49,13 +55,25 @@ fn main() {
             let output = args.get(3).expect("使い方: compress-folder <input_dir> <output_dir>");
             pollster::block_on(compress_folder(input, output));
         }
+        Some("pack") => {
+            let input  = args.get(2).expect("使い方: pack <input_dir> <output_dir>");
+            let output = args.get(3).expect("使い方: pack <input_dir> <output_dir>");
+            pollster::block_on(pack(input, output));
+        }
+        Some("unpack") => {
+            let input  = args.get(2).expect("使い方: unpack <input_dir> <output_dir>");
+            let output = args.get(3).expect("使い方: unpack <input_dir> <output_dir>");
+            unpack(input, output);
+        }
         Some("--bench") => {
             pollster::block_on(run());
         }
         _ => {
-            println!("AssetCrunch — GPU-accelerated game asset compressor");
+            println!("AssetCrunch v0.2.0 — Game Asset Pack Optimizer");
             println!();
             println!("使い方:");
+            println!("  assetcrunch pack              <input_dir>      <output_dir>   # メイン機能");
+            println!("  assetcrunch unpack            <input_dir>      <output_dir>   # 完全復元");
             println!("  assetcrunch compress          <input.wav>      <output.gcwav>");
             println!("  assetcrunch decompress        <input.gcwav>    <output.wav>");
             println!("  assetcrunch compress-mesh     <input.obj/fbx>  <output.gcmesh>");
@@ -66,8 +84,9 @@ fn main() {
             println!("  assetcrunch decompress-folder <input_dir>      <output_dir>");
             println!();
             println!("対応フォーマット:");
-            println!("  圧縮対象 : wav, obj, fbx, json, txt");
-            println!("  スキップ : png, jpg, mp3, ogg (圧縮済みフォーマット)");
+            println!("  圧縮対象 : wav, obj, fbx, json, txt, csv, xml");
+            println!("  スキップ : png, jpg, mp3, ogg, webp (圧縮済みフォーマット)");
+            println!("  自動判定 : 圧縮が逆効果なファイルは元ファイルをコピー");
             println!();
             println!("オプション:");
             println!("  --bench  ベンチマークを実行");
@@ -82,12 +101,32 @@ struct Params {
     chunk_count: u32,
 }
 
-const CHUNK_SIZE:  u32 = 65536;
-const OUT_STRIDE:  u32 = CHUNK_SIZE + 1024;
-const SUB_COUNT:   u32 = 4;
-const SUB_SIZE:    u32 = 16384;
-const SUB_STRIDE:  u32 = SUB_SIZE + 256;
-const BENCH_RUNS: usize = 5;
+#[cfg(windows)]
+fn show_popup(title: &str, message: &str) {
+    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let msg_wide: Vec<u16>   = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            None,
+            windows::core::PCWSTR(msg_wide.as_ptr()),
+            windows::core::PCWSTR(title_wide.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::MB_OK |
+            windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_popup(_title: &str, message: &str) {
+    println!("{}", message);
+}
+
+const CHUNK_SIZE:    u32   = 65536;
+const OUT_STRIDE:    u32   = CHUNK_SIZE + 1024;
+const SUB_COUNT:     u32   = 4;
+const SUB_SIZE:      u32   = 16384;
+const SUB_STRIDE:    u32   = SUB_SIZE + 256;
+const BENCH_RUNS:    usize = 5;
 const MAX_GPU_BYTES: usize = 64 * 1024 * 1024; // 64MB
 
 async fn setup_gpu() -> (Device, Queue, ComputePipeline, BindGroupLayout) {
@@ -139,7 +178,6 @@ async fn setup_gpu() -> (Device, Queue, ComputePipeline, BindGroupLayout) {
     (device, queue, pipeline, bgl)
 }
 
-// 128MB超のデータを分割して処理するラッパー
 async fn gpu_compress_data(
     device: &Device,
     queue: &Queue,
@@ -301,9 +339,7 @@ async fn compress_wav(input: &str, output: &str) {
     out_data.extend_from_slice(&(wav.header.len() as u32).to_le_bytes());
     out_data.extend_from_slice(&wav.header);
     out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
-    for &sz in &sub_sizes {
-        out_data.extend_from_slice(&sz.to_le_bytes());
-    }
+    for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
     out_data.extend_from_slice(&packed);
 
     std::fs::write(output, &out_data).expect("書き込み失敗");
@@ -406,9 +442,7 @@ async fn compress_mesh(input: &str, output: &str) {
     out_data.push(mf.ext.len() as u8);
     out_data.extend_from_slice(mf.ext.as_bytes());
     out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
-    for &sz in &sub_sizes {
-        out_data.extend_from_slice(&sz.to_le_bytes());
-    }
+    for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
     out_data.extend_from_slice(&packed);
     std::fs::write(output, &out_data).expect("書き込み失敗");
     println!("出力: {}", output);
@@ -461,6 +495,440 @@ fn decompress_mesh(input: &str, output_dir: &str) {
     println!("出力: {}", out_path.display());
 }
 
+// ========== pack / unpack ==========
+
+async fn pack(input_dir: &str, output_dir: &str) {
+    use std::path::Path;
+
+    let out_path   = Path::new(output_dir);
+    let assets_path = out_path.join("assets");
+    std::fs::create_dir_all(&assets_path).expect("出力フォルダ作成失敗");
+
+    let (device, queue, pipeline, bgl) = setup_gpu().await;
+
+    let mut mf = manifest::Manifest::new(input_dir, output_dir);
+
+    println!("\nAssetCrunch Pack");
+    println!("  Input : {}", input_dir);
+    println!("  Output: {}", output_dir);
+    println!();
+
+    let mut total_original = 0u64;
+    let mut total_output   = 0u64;
+
+    pack_dir(
+        Path::new(input_dir),
+        &assets_path,
+        Path::new(input_dir),
+        &device, &queue, &pipeline, &bgl,
+        &mut mf,
+        &mut total_original,
+        &mut total_output,
+    ).await;
+
+    mf.finalize();
+
+    let manifest_path = out_path.join("assetcrunch_manifest.json");
+    mf.save(manifest_path.to_str().unwrap());
+
+    let saved = total_original as i64 - total_output as i64;
+    println!("\n========== Pack Report ==========");
+    println!("  Original : {:.2} MB", total_original as f64 / 1024.0 / 1024.0);
+    println!("  Output   : {:.2} MB", total_output   as f64 / 1024.0 / 1024.0);
+    println!("  Saved    : {:.2} MB", saved as f64 / 1024.0 / 1024.0);
+    println!("  Reduction: {:.1}%",
+        (1.0 - total_output as f64 / (total_original as f64).max(1.0)) * 100.0);
+    println!("  Files    : {} total / {} compressed / {} copied",
+        mf.summary.total_files,
+        mf.summary.compressed_files,
+        mf.summary.copied_files);
+    println!("  Manifest : {}", manifest_path.display());
+
+    let popup_msg = format!(
+        "Pack完了！\n\n元サイズ  : {:.2} MB\n圧縮後    : {:.2} MB\n削減量    : {:.2} MB\n削減率    : {:.1}%\nファイル数: {} total / {} 圧縮 / {} コピー",
+        total_original as f64 / 1024.0 / 1024.0,
+        total_output   as f64 / 1024.0 / 1024.0,
+        saved as f64 / 1024.0 / 1024.0,
+        (1.0 - total_output as f64 / (total_original as f64).max(1.0)) * 100.0,
+        mf.summary.total_files,
+        mf.summary.compressed_files,
+        mf.summary.copied_files,
+    );
+    show_popup("AssetCrunch Pack Report", &popup_msg);
+
+    // ポップアップでレポート表示
+    let popup_msg = format!(
+        "Pack完了！\n\n\
+        元サイズ  : {:.2} MB\n\
+        圧縮後    : {:.2} MB\n\
+        削減量    : {:.2} MB\n\
+        削減率    : {:.1}%\n\
+        ファイル数: {} total / {} 圧縮 / {} コピー",
+        total_original as f64 / 1024.0 / 1024.0,
+        total_output   as f64 / 1024.0 / 1024.0,
+        saved as f64 / 1024.0 / 1024.0,
+        (1.0 - total_output as f64 / (total_original as f64).max(1.0)) * 100.0,
+        mf.summary.total_files,
+        mf.summary.compressed_files,
+        mf.summary.copied_files,
+    );
+    show_popup("AssetCrunch Pack Report", &popup_msg);
+}
+
+fn pack_dir<'a>(
+    input_dir:  &'a std::path::Path,
+    output_dir: &'a std::path::Path,
+    base_dir:   &'a std::path::Path,
+    device:   &'a Device,
+    queue:    &'a Queue,
+    pipeline: &'a ComputePipeline,
+    bgl:      &'a BindGroupLayout,
+    mf:       &'a mut manifest::Manifest,
+    total_original: &'a mut u64,
+    total_output:   &'a mut u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let entries = match std::fs::read_dir(input_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let in_path  = entry.path();
+            let filename = in_path.file_name().unwrap().to_string_lossy().to_string();
+
+            if in_path.is_dir() {
+                let sub_out = output_dir.join(&filename);
+                std::fs::create_dir_all(&sub_out).ok();
+                pack_dir(
+                    &in_path, &sub_out, base_dir,
+                    device, queue, pipeline, bgl,
+                    mf, total_original, total_output,
+                ).await;
+                continue;
+            }
+
+            let ext = in_path.extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            let relative = in_path.strip_prefix(base_dir)
+                .unwrap_or(&in_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            match ext.as_str() {
+                "wav" => {
+                    let wav_file = match wav::WavFile::load(in_path.to_str().unwrap()) {
+                        Ok(w) => w,
+                        Err(_) => {
+                            let out_file = output_dir.join(&filename);
+                            let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
+                            std::fs::copy(&in_path, &out_file).ok();
+                            let out_rel = out_file.strip_prefix(base_dir)
+                                .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                            mf.add_skipped(&relative, &out_rel, "wav", "load_error", size);
+                            *total_original += size;
+                            *total_output   += size;
+                            continue;
+                        }
+                    };
+
+                    let original_size = (wav_file.header.len() + wav_file.pcm_data.len()) as u64;
+
+                    if wav_file.pcm_data.is_empty() {
+                        let out_file = output_dir.join(&filename);
+                        std::fs::copy(&in_path, &out_file).ok();
+                        let out_rel = out_file.strip_prefix(base_dir)
+                            .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                        mf.add_skipped(&relative, &out_rel, "wav", "empty_pcm", original_size);
+                        *total_original += original_size;
+                        *total_output   += original_size;
+                        continue;
+                    }
+
+                    let pcm_enc = wav::delta_encode(
+                        &wav_file.pcm_data, wav_file.channels, wav_file.bits_per_sample
+                    );
+                    let (sub_sizes, packed) = gpu_compress_data(
+                        device, queue, pipeline, bgl, &pcm_enc
+                    ).await;
+                    let chunk_count = (pcm_enc.len() as u32).div_ceil(CHUNK_SIZE) as usize;
+                    let compressed_size = (8 + 4 + wav_file.header.len() + 4
+                        + sub_sizes.len() * 4 + packed.len()) as u64;
+
+                    if compressed_size >= original_size {
+                        let out_file = output_dir.join(&filename);
+                        std::fs::copy(&in_path, &out_file).ok();
+                        let out_rel = out_file.strip_prefix(base_dir)
+                            .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                        mf.add_skipped(&relative, &out_rel, "wav",
+                            "compression_ineffective", original_size);
+                        println!("  [SKIP ] {:.<50} {:>7.1}KB (圧縮効果なし)",
+                            filename, original_size as f64 / 1024.0);
+                        *total_original += original_size;
+                        *total_output   += original_size;
+                        continue;
+                    }
+
+                    let out_stem = in_path.file_stem().unwrap().to_string_lossy();
+                    let out_file = output_dir.join(format!("{}.gcwav", out_stem));
+                    let mut out_data = Vec::new();
+                    out_data.extend_from_slice(b"GCWAV001");
+                    out_data.extend_from_slice(&(wav_file.header.len() as u32).to_le_bytes());
+                    out_data.extend_from_slice(&wav_file.header);
+                    out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+                    for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
+                    out_data.extend_from_slice(&packed);
+                    std::fs::write(&out_file, &out_data).expect("書き込み失敗");
+
+                    let out_rel = out_file.strip_prefix(base_dir)
+                        .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                    mf.add_compressed(&relative, &out_rel, "wav",
+                        "delta+gpu_lz4", original_size, compressed_size);
+
+                    println!("  [WAV ] {:.<50} {:>7.1}KB → {:>7.1}KB  ({:.1}%削減)",
+                        filename,
+                        original_size   as f64 / 1024.0,
+                        compressed_size as f64 / 1024.0,
+                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0);
+                    *total_original += original_size;
+                    *total_output   += compressed_size;
+                }
+
+                "obj" | "fbx" | "json" | "txt" | "csv" | "xml" => {
+                    let mesh_file = match mesh::MeshFile::load(in_path.to_str().unwrap()) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            let out_file = output_dir.join(&filename);
+                            let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
+                            std::fs::copy(&in_path, &out_file).ok();
+                            let out_rel = out_file.strip_prefix(base_dir)
+                                .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                            mf.add_skipped(&relative, &out_rel, &ext, "load_error", size);
+                            *total_original += size;
+                            *total_output   += size;
+                            continue;
+                        }
+                    };
+
+                    let original_size = mesh_file.data.len() as u64;
+                    let (sub_sizes, packed) = gpu_compress_data(
+                        device, queue, pipeline, bgl, &mesh_file.data
+                    ).await;
+                    let chunk_count = (mesh_file.data.len() as u32).div_ceil(CHUNK_SIZE) as usize;
+                    let compressed_size = (8 + 1 + mesh_file.ext.len() + 4
+                        + sub_sizes.len() * 4 + packed.len()) as u64;
+
+                    if compressed_size >= original_size {
+                        let out_file = output_dir.join(&filename);
+                        std::fs::copy(&in_path, &out_file).ok();
+                        let out_rel = out_file.strip_prefix(base_dir)
+                            .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                        mf.add_skipped(&relative, &out_rel, &ext,
+                            "compression_ineffective", original_size);
+                        println!("  [SKIP ] {:.<50} {:>7.1}KB (圧縮効果なし)",
+                            filename, original_size as f64 / 1024.0);
+                        *total_original += original_size;
+                        *total_output   += original_size;
+                        continue;
+                    }
+
+                    let out_stem = in_path.file_stem().unwrap().to_string_lossy();
+                    let out_file = output_dir.join(format!("{}.gcmesh", out_stem));
+                    let mut out_data = Vec::new();
+                    out_data.extend_from_slice(b"GCMESH01");
+                    out_data.push(mesh_file.ext.len() as u8);
+                    out_data.extend_from_slice(mesh_file.ext.as_bytes());
+                    out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
+                    for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
+                    out_data.extend_from_slice(&packed);
+                    std::fs::write(&out_file, &out_data).expect("書き込み失敗");
+
+                    let out_rel = out_file.strip_prefix(base_dir)
+                        .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                    mf.add_compressed(&relative, &out_rel, &ext,
+                        "gpu_lz4", original_size, compressed_size);
+
+                    let kind = match ext.as_str() {
+                        "obj"  => "OBJ  ",
+                        "fbx"  => "FBX  ",
+                        "json" => "JSON ",
+                        "txt"  => "TXT  ",
+                        "csv"  => "CSV  ",
+                        "xml"  => "XML  ",
+                        _      => "BIN  ",
+                    };
+                    println!("  [{}] {:.<50} {:>7.1}KB → {:>7.1}KB  ({:.1}%削減)",
+                        kind, filename,
+                        original_size   as f64 / 1024.0,
+                        compressed_size as f64 / 1024.0,
+                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0);
+                    *total_original += original_size;
+                    *total_output   += compressed_size;
+                }
+
+                "png" | "jpg" | "jpeg" | "mp3" | "ogg" | "webp" | "gif" => {
+                    let out_file = output_dir.join(&filename);
+                    let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    std::fs::copy(&in_path, &out_file).ok();
+                    let out_rel = out_file.strip_prefix(base_dir)
+                        .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                    mf.add_skipped(&relative, &out_rel, &ext, "already_compressed", size);
+                    println!("  [COPY ] {:.<50} {:>7.1}KB (圧縮済み)",
+                        filename, size as f64 / 1024.0);
+                    *total_original += size;
+                    *total_output   += size;
+                }
+
+                _ => {
+                    let out_file = output_dir.join(&filename);
+                    let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    std::fs::copy(&in_path, &out_file).ok();
+                    let out_rel = out_file.strip_prefix(base_dir)
+                        .unwrap_or(&out_file).to_string_lossy().replace('\\', "/");
+                    mf.add_skipped(&relative, &out_rel, &ext, "unknown_format", size);
+                    *total_original += size;
+                    *total_output   += size;
+                }
+            }
+        }
+    })
+}
+
+fn unpack(input_dir: &str, output_dir: &str) {
+    use std::path::Path;
+
+    let manifest_path = Path::new(input_dir).join("assetcrunch_manifest.json");
+    let mf = match manifest::Manifest::load(manifest_path.to_str().unwrap()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("マニフェスト読み込み失敗: {}", e);
+            return;
+        }
+    };
+
+    println!("\nAssetCrunch Unpack");
+    println!("  Input : {}", input_dir);
+    println!("  Output: {}", output_dir);
+    println!();
+
+    let mut restored = 0u64;
+    let mut copied   = 0u64;
+
+    for file in &mf.files {
+        let in_path  = Path::new(input_dir).join("assets").join(
+            Path::new(&file.output).file_name().unwrap()
+        );
+        let out_path = Path::new(output_dir).join(&file.original);
+        std::fs::create_dir_all(out_path.parent().unwrap()).ok();
+
+        match file.method.as_str() {
+            "delta+gpu_lz4" => {
+                let data = match std::fs::read(&in_path) {
+                    Ok(d) => d,
+                    Err(e) => { println!("  スキップ: {} — {}", file.original, e); continue; }
+                };
+                if data.len() < 8 || &data[0..8] != b"GCWAV001" { continue; }
+
+                let mut pos = 8usize;
+                let header_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                let header = data[pos..pos+header_len].to_vec();
+                pos += header_len;
+                let chunk_count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+
+                let total_subs = chunk_count * SUB_COUNT as usize;
+                let mut sub_sizes = Vec::with_capacity(total_subs);
+                for _ in 0..total_subs {
+                    sub_sizes.push(u32::from_le_bytes(
+                        data[pos..pos+4].try_into().unwrap()) as usize);
+                    pos += 4;
+                }
+
+                let mut pcm_delta = Vec::new();
+                for ci in 0..chunk_count {
+                    for si in 0..SUB_COUNT as usize {
+                        let sz = sub_sizes[ci * SUB_COUNT as usize + si];
+                        if sz == 0 { continue; }
+                        let chunk = &data[pos..pos + sz];
+                        if let Ok(dec) = lz4_flex::block::decompress(chunk, SUB_SIZE as usize) {
+                            pcm_delta.extend_from_slice(&dec);
+                        }
+                        pos += sz;
+                    }
+                }
+
+                let channels        = u16::from_le_bytes(header[22..24].try_into().unwrap());
+                let bits_per_sample = u16::from_le_bytes(header[34..36].try_into().unwrap());
+                let pcm_data  = wav::delta_decode(&pcm_delta, channels, bits_per_sample);
+                let wav_bytes = wav::WavFile::rebuild(&header, &pcm_data);
+                let size = wav_bytes.len() as u64;
+                std::fs::write(&out_path, &wav_bytes).expect("書き込み失敗");
+                println!("  [WAV ] {}", file.original);
+                restored += size;
+            }
+
+            "gpu_lz4" => {
+                let data = match std::fs::read(&in_path) {
+                    Ok(d) => d,
+                    Err(e) => { println!("  スキップ: {} — {}", file.original, e); continue; }
+                };
+                if data.len() < 8 || &data[0..8] != b"GCMESH01" { continue; }
+
+                let mut pos = 8usize;
+                let ext_len = data[pos] as usize;
+                pos += 1 + ext_len;
+                let chunk_count = u32::from_le_bytes(
+                    data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+
+                let total_subs = chunk_count * SUB_COUNT as usize;
+                let mut sub_sizes = Vec::with_capacity(total_subs);
+                for _ in 0..total_subs {
+                    sub_sizes.push(u32::from_le_bytes(
+                        data[pos..pos+4].try_into().unwrap()) as usize);
+                    pos += 4;
+                }
+
+                let mut decompressed = Vec::new();
+                for ci in 0..chunk_count {
+                    for si in 0..SUB_COUNT as usize {
+                        let sz = sub_sizes[ci * SUB_COUNT as usize + si];
+                        if sz == 0 { continue; }
+                        let chunk = &data[pos..pos + sz];
+                        if let Ok(dec) = lz4_flex::block::decompress(chunk, SUB_SIZE as usize) {
+                            decompressed.extend_from_slice(&dec);
+                        }
+                        pos += sz;
+                    }
+                }
+
+                let size = decompressed.len() as u64;
+                std::fs::write(&out_path, &decompressed).expect("書き込み失敗");
+                println!("  [MESH] {}", file.original);
+                restored += size;
+            }
+
+            _ => {
+                if let Ok(_) = std::fs::copy(&in_path, &out_path) {
+                    let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    copied += size;
+                }
+            }
+        }
+    }
+
+    println!("\n========== Unpack Complete ==========");
+    println!("  解凍: {:.2} MB", restored as f64 / 1024.0 / 1024.0);
+    println!("  コピー: {:.2} MB", copied as f64 / 1024.0 / 1024.0);
+    println!("  出力先: {}", output_dir);
+}
+
+// ========== compress-folder / decompress-folder ==========
+
 async fn compress_folder(input_dir: &str, output_dir: &str) {
     use std::path::Path;
 
@@ -489,8 +957,7 @@ async fn compress_folder(input_dir: &str, output_dir: &str) {
         total_original   as f64 / 1024.0 / 1024.0,
         total_compressed as f64 / 1024.0 / 1024.0,
         (1.0 - total_compressed as f64 / (total_original as f64).max(1.0)) * 100.0);
-    println!("  コピー   : {:.2} MB（圧縮済みフォーマット等）",
-        total_copied as f64 / 1024.0 / 1024.0);
+    println!("  コピー   : {:.2} MB", total_copied as f64 / 1024.0 / 1024.0);
     println!("  出力先   : {}", output_dir);
 
     let mut sorted = results.clone();
@@ -544,7 +1011,7 @@ fn process_dir<'a>(
 
             match ext.as_str() {
                 "wav" => {
-                    let wav = match wav::WavFile::load(in_path.to_str().unwrap()) {
+                    let wav_file = match wav::WavFile::load(in_path.to_str().unwrap()) {
                         Ok(w) => w,
                         Err(e) => {
                             println!("  スキップ: {} — {}", filename, e);
@@ -553,25 +1020,32 @@ fn process_dir<'a>(
                             continue;
                         }
                     };
-                    let original_size = wav.header.len() + wav.pcm_data.len();
+                    let original_size = wav_file.header.len() + wav_file.pcm_data.len();
 
-                    if wav.pcm_data.is_empty() {
-                        println!("  [COPY ] {:.<50} {:>7.1}KB (空のPCMデータ)",
-                            filename, original_size as f64 / 1024.0);
+                    if wav_file.pcm_data.is_empty() {
                         let out_file = output_dir.join(&filename);
                         std::fs::copy(&in_path, &out_file).ok();
                         continue;
                     }
 
                     let pcm_enc = wav::delta_encode(
-                        &wav.pcm_data, wav.channels, wav.bits_per_sample
+                        &wav_file.pcm_data, wav_file.channels, wav_file.bits_per_sample
                     );
                     let (sub_sizes, packed) = gpu_compress_data(
                         device, queue, pipeline, bgl, &pcm_enc
                     ).await;
                     let chunk_count = (pcm_enc.len() as u32).div_ceil(CHUNK_SIZE) as usize;
-                    let compressed_size = 8 + 4 + wav.header.len() + 4
+                    let compressed_size = 8 + 4 + wav_file.header.len() + 4
                         + sub_sizes.len() * 4 + packed.len();
+
+                    if compressed_size >= original_size {
+                        let out_file = output_dir.join(&filename);
+                        std::fs::copy(&in_path, &out_file).ok();
+                        println!("  [SKIP ] {:.<50} {:>7.1}KB (圧縮効果なし→コピー)",
+                            filename, original_size as f64 / 1024.0);
+                        *total_copied += original_size as u64;
+                        continue;
+                    }
 
                     let out_file = output_dir.join(
                         format!("{}.gcwav",
@@ -579,8 +1053,8 @@ fn process_dir<'a>(
                     );
                     let mut out_data = Vec::new();
                     out_data.extend_from_slice(b"GCWAV001");
-                    out_data.extend_from_slice(&(wav.header.len() as u32).to_le_bytes());
-                    out_data.extend_from_slice(&wav.header);
+                    out_data.extend_from_slice(&(wav_file.header.len() as u32).to_le_bytes());
+                    out_data.extend_from_slice(&wav_file.header);
                     out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
                     for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
                     out_data.extend_from_slice(&packed);
@@ -597,8 +1071,8 @@ fn process_dir<'a>(
                     results.push((filename, original_size, compressed_size, ratio));
                 }
 
-                "obj" | "fbx" | "json" | "txt" => {
-                    let mf = match mesh::MeshFile::load(in_path.to_str().unwrap()) {
+                "obj" | "fbx" | "json" | "txt" | "csv" | "xml" => {
+                    let mesh_file = match mesh::MeshFile::load(in_path.to_str().unwrap()) {
                         Ok(m) => m,
                         Err(e) => {
                             println!("  スキップ: {} — {}", filename, e);
@@ -607,13 +1081,22 @@ fn process_dir<'a>(
                             continue;
                         }
                     };
-                    let original_size = mf.data.len();
+                    let original_size = mesh_file.data.len();
                     let (sub_sizes, packed) = gpu_compress_data(
-                        device, queue, pipeline, bgl, &mf.data
+                        device, queue, pipeline, bgl, &mesh_file.data
                     ).await;
-                    let chunk_count = (mf.data.len() as u32).div_ceil(CHUNK_SIZE) as usize;
-                    let compressed_size = 8 + 1 + mf.ext.len() + 4
+                    let chunk_count = (mesh_file.data.len() as u32).div_ceil(CHUNK_SIZE) as usize;
+                    let compressed_size = 8 + 1 + mesh_file.ext.len() + 4
                         + sub_sizes.len() * 4 + packed.len();
+
+                    if compressed_size >= original_size {
+                        let out_file = output_dir.join(&filename);
+                        std::fs::copy(&in_path, &out_file).ok();
+                        println!("  [SKIP ] {:.<50} {:>7.1}KB (圧縮効果なし→コピー)",
+                            filename, original_size as f64 / 1024.0);
+                        *total_copied += original_size as u64;
+                        continue;
+                    }
 
                     let out_file = output_dir.join(
                         format!("{}.gcmesh",
@@ -621,8 +1104,8 @@ fn process_dir<'a>(
                     );
                     let mut out_data = Vec::new();
                     out_data.extend_from_slice(b"GCMESH01");
-                    out_data.push(mf.ext.len() as u8);
-                    out_data.extend_from_slice(mf.ext.as_bytes());
+                    out_data.push(mesh_file.ext.len() as u8);
+                    out_data.extend_from_slice(mesh_file.ext.as_bytes());
                     out_data.extend_from_slice(&(chunk_count as u32).to_le_bytes());
                     for &sz in &sub_sizes { out_data.extend_from_slice(&sz.to_le_bytes()); }
                     out_data.extend_from_slice(&packed);
@@ -630,9 +1113,11 @@ fn process_dir<'a>(
 
                     let kind = match ext.as_str() {
                         "obj"  => "OBJ  ",
-                        "fbx"  => if mf.is_ascii_fbx { "FBX/A" } else { "FBX/B" },
+                        "fbx"  => if mesh_file.is_ascii_fbx { "FBX/A" } else { "FBX/B" },
                         "json" => "JSON ",
                         "txt"  => "TXT  ",
+                        "csv"  => "CSV  ",
+                        "xml"  => "XML  ",
                         _      => "BIN  ",
                     };
 
@@ -651,8 +1136,6 @@ fn process_dir<'a>(
                     let out_file = output_dir.join(&filename);
                     let size = in_path.metadata().map(|m| m.len()).unwrap_or(0);
                     std::fs::copy(&in_path, &out_file).ok();
-                    println!("  [COPY ] {:.<50} {:>7.1}KB",
-                        filename, size as f64 / 1024.0);
                     *total_copied += size;
                 }
             }
@@ -747,10 +1230,7 @@ fn decompress_dir(
                         let chunk = &data[pos..pos + sz];
                         match lz4_flex::block::decompress(chunk, SUB_SIZE as usize) {
                             Ok(dec) => pcm_delta.extend_from_slice(&dec),
-                            Err(e) => {
-                                println!("  解凍失敗: {} — {}", filename, e);
-                                break;
-                            }
+                            Err(e) => { println!("  解凍失敗: {} — {}", filename, e); break; }
                         }
                         pos += sz;
                     }
@@ -758,7 +1238,7 @@ fn decompress_dir(
 
                 let channels        = u16::from_le_bytes(header[22..24].try_into().unwrap());
                 let bits_per_sample = u16::from_le_bytes(header[34..36].try_into().unwrap());
-                let pcm_data = wav::delta_decode(&pcm_delta, channels, bits_per_sample);
+                let pcm_data  = wav::delta_decode(&pcm_delta, channels, bits_per_sample);
                 let wav_bytes = wav::WavFile::rebuild(&header, &pcm_data);
 
                 let out_file = output_dir.join(
@@ -806,10 +1286,7 @@ fn decompress_dir(
                         let chunk = &data[pos..pos + sz];
                         match lz4_flex::block::decompress(chunk, SUB_SIZE as usize) {
                             Ok(dec) => decompressed.extend_from_slice(&dec),
-                            Err(e) => {
-                                println!("  解凍失敗: {} — {}", filename, e);
-                                break;
-                            }
+                            Err(e) => { println!("  解凍失敗: {} — {}", filename, e); break; }
                         }
                         pos += sz;
                     }
@@ -837,6 +1314,8 @@ fn decompress_dir(
         }
     }
 }
+
+// ========== ベンチマーク ==========
 
 fn gen_random(size: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
@@ -931,7 +1410,6 @@ async fn run() {
             ],
         });
 
-        // ウォームアップ
         {
             let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
             { let mut p = enc.begin_compute_pass(&ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -956,7 +1434,6 @@ async fn run() {
             staging_sizes.unmap();
         }
 
-        // 圧縮サイズ取得
         {
             let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
             { let mut p = enc.begin_compute_pass(&ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -1007,4 +1484,25 @@ async fn run() {
 
         println!("[比較] GPU speedup: {:.2}x\n", gpu_tp / cpu_tp);
     }
+
+    #[cfg(windows)]
+fn show_popup(title: &str, message: &str) {
+    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let msg_wide: Vec<u16>   = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(msg_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
+
+#[cfg(not(windows))]
+fn show_popup(_title: &str, message: &str) {
+    println!("{}", message);
+}
+}
+
+

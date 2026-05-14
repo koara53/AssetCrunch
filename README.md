@@ -6,7 +6,7 @@ GPU-accelerated game asset pack optimizer for indie developers.
 配布前の素材フォルダを自動で最適化するCLIツールです。
 
 
-![画像}(https://github.com/user-attachments/assets/b2e123b5-b281-4b7c-941f-9b804e31510b)
+![画像］(https://github.com/user-attachments/assets/b2e123b5-b281-4b7c-941f-9b804e31510b)
 
 ## 実測圧縮率
 
